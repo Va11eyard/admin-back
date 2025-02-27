@@ -1,66 +1,82 @@
 package org.example.java.util;
 
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
+import io.jsonwebtoken.Claims;
 import org.example.java.service.UserService;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.context.annotation.Lazy;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
-import org.springframework.lang.NonNull;
 
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Collectors;
 
 @Component
 public class JwtRequestFilter extends OncePerRequestFilter {
-    private static final Logger LOGGER = LoggerFactory.getLogger(JwtRequestFilter.class);
-    private JwtTokenUtil jwtTokenUtil;
-    private final UserService userService;
-
+    @Autowired
+    private UserService userService;
 
     @Autowired
-    public JwtRequestFilter(@Lazy UserService userService, JwtTokenUtil jwtTokenUtil) {
-        this.userService = userService;
-        this.jwtTokenUtil = jwtTokenUtil;
-    }
+    private JwtTokenUtil jwtTokenUtil;
 
     @Override
-    protected void doFilterInternal(@NonNull HttpServletRequest request, @NonNull HttpServletResponse response, @NonNull FilterChain filterChain) throws ServletException, IOException {
-        final String authorizationHeader = request.getHeader("Authorization");
-        LOGGER.warn("HEADER IS {}", authorizationHeader);
-        String username = null;
-        String jwt = null;
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws IOException, jakarta.servlet.ServletException {
+        String path = request.getRequestURI();
+        logger.debug("Processing request for path: " + path);
 
-        if (authorizationHeader != null && authorizationHeader.startsWith("Bearer ")) {
-            jwt = authorizationHeader.substring(7);
-            username = jwtTokenUtil.extractUsername(jwt);
+        if (path.equals("/api/login") || path.equals("/api/register")) {
+            chain.doFilter(request, response);
+            return;
         }
 
-        if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
-            UserDetails userDetails = this.userService.loadUserByUsername(username);
-            logger.warn("User authenticated: " + username);
-            logger.warn("Authorities: " + userDetails.getAuthorities());
-
-            if (jwtTokenUtil.validateToken(jwt, userDetails)) {
-                UsernamePasswordAuthenticationToken authenticationToken = new UsernamePasswordAuthenticationToken(
-                        userDetails, null, userDetails.getAuthorities());
-                authenticationToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
-                SecurityContextHolder.getContext().setAuthentication(authenticationToken);
-                LOGGER.warn("Authentication set for user: {}", userDetails.getUsername());
-            }
-            else{
-                LOGGER.warn("I stuck here, help me ,My lord!");
-            }
+        String authHeader = request.getHeader("Authorization");
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            logger.warn("No valid Bearer token found for " + path);
+            chain.doFilter(request, response);
+            return;
         }
 
-        filterChain.doFilter(request, response);
+        String token = authHeader.substring(7);
+        try {
+            String username = jwtTokenUtil.extractUsername(token);
+            logger.debug("Extracted username from token: " + username);
+
+            if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+                UserDetails userDetails = userService.loadUserByUsername(username);
+                if (jwtTokenUtil.validateToken(token, userDetails)) {
+                    Claims claims = jwtTokenUtil.extractAllClaims(token);
+                    @SuppressWarnings("unchecked")
+                    List<String> roles = (List<String>) claims.get("roles", List.class);
+                    List<SimpleGrantedAuthority> authorities = (roles != null && !roles.isEmpty())
+                            ? roles.stream()
+                                .map(role -> new SimpleGrantedAuthority(role.startsWith("ROLE_") ? role : "ROLE_" + role))
+                                .collect(Collectors.toList())
+                            : Collections.singletonList(new SimpleGrantedAuthority("ROLE_user")); // Fallback
+
+                    logger.debug("Authorities for " + username + ": " + authorities);
+
+                    UsernamePasswordAuthenticationToken authToken =
+                            new UsernamePasswordAuthenticationToken(userDetails, null, authorities);
+                    authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                    SecurityContextHolder.getContext().setAuthentication(authToken);
+                    logger.info("Successfully authenticated " + username + " for " + path + " with roles: " + authorities);
+                } else {
+                    logger.warn("Token validation failed for " + username);
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Error processing JWT token: " + e.getMessage(), e);
+            throw e; // Re-throw to trigger exception handling
+        }
+        chain.doFilter(request, response);
     }
 }
